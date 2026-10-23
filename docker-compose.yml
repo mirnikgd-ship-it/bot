@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  parser:
+    build: .
+    container_name: povarenok_parser
+    restart: unless-stopped
+    network_mode: "host" # <--- ВАЖНО: подключаемся к сети сервера, чтобы видеть postgres
+    environment:
+      # Замените эти данные на ваши реальные данные от postgres_container
+      - DB_HOST=127.0.0.1
+      - DB_NAME=recipes_db
+      - DB_USER=postgres
+      - DB_PASSWORD=123Secret_a # <--- ОБЯЗАТЕЛЬНО УКАЖИТЕ СВОЙ ПАРОЛЬ
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G

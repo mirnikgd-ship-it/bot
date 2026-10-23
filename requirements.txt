@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+natasha
+nltk
+setuptools<82
+psycopg2-binary
