@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем сам скрипт парсера
-COPY parser.py .
+COPY main.py .
 
 # Запускаем скрипт
-CMD ["python", "-u", "parser.py"]
+CMD ["python", "-u", "main.py"]
