@@ -74,36 +74,44 @@ def split_ingredient(text):
 # ==========================================
 # 3. ПАРСИНГ ОДНОГО РЕЦЕПТА (только скачивание)
 # ==========================================
-def parse_povarenok_recipe(url):
+def fetch_recipe(url):
+    """Скачивает и парсит один рецепт (ИСПРАВЛЕННЫЙ)"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 403: # Если бан
-            return {'error': '403'}
-        response.raise_for_status()
+        if response.status_code != 200: return None
+        
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        title_tag = soup.find('h1')
-        title = title_tag.get_text(strip=True) if title_tag else "Без названия"
-        
+        # --- ИСПРАВЛЕНИЕ ЗАГОЛОВКА ---
+        # Берем заголовок из OG-тега (там всегда чистое название) или из <title>
+        meta_title = soup.find('meta', property='og:title')
+        if meta_title:
+            title = meta_title['content'].strip()
+        else:
+            title_tag = soup.find('title')
+            title = title_tag.get_text(strip=True).split(' - ')[0] if title_tag else "Без названия"
+            
+        # --- ИСПРАВЛЕНИЕ ИНГРЕДИЕНТОВ ---
         ingredients = []
         ing_container = soup.find('div', class_='ingredients-bl')
+        
         if ing_container:
             for li in ing_container.find_all('li'):
                 text = li.get_text(separator=' ', strip=True)
                 if text: ingredients.append(text)
         else:
-            ing_header = soup.find(lambda tag: tag.name in ['h2', 'h3', 'div'] and 'Ингредиенты' in tag.get_text())
-            if ing_header:
-                ing_list = ing_header.find_next('ul')
-                if ing_list:
-                    for li in ing_list.find_all('li'):
-                        text = li.get_text(separator=' ', strip=True)
-                        if text and len(text) < 150: ingredients.append(text)
-                                
+            # Если блока ингредиентов нет — это страница-пустышка или тег. 
+            # Возвращаем None, чтобы не засорять базу!
+            return None 
+            
+        if not ingredients:
+            return None
+            
         clean_ingredients = [ing for ing in ingredients if not any(w in ing.lower() for w in ['комментарий', 'отзыв'])]
+        
         return {'url': url, 'title': title, 'ingredients': clean_ingredients}
-    except Exception as e:
+    except Exception:
         return None
 
 # ==========================================

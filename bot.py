@@ -1,150 +1,141 @@
-import sqlite3
+import psycopg2
+import os
 import re
-from natasha import MorphVocab, NewsEmbedding, NewsMorphTagger, Doc, Segmenter
+import base64
+import traceback
 
 # ==========================================
-# 1. ИНИЦИАЛИЗАЦИЯ NLP
+# 1. НАСТРОЙКИ ПОДКЛЮЧЕНИЯ К БД
 # ==========================================
-print("Загрузка NLP моделей...")
-morph_vocab = MorphVocab()
-segmenter = Segmenter()
-emb = NewsEmbedding()
-morph_tagger = NewsMorphTagger(emb)
+# Если вы запускаете бота на компьютере, а база на сервере, 
+# укажите здесь IP-адрес сервера вместо 'localhost'
+DB_HOST = os.getenv('DB_HOST', '192.168.133.20')
+DB_NAME = os.getenv('DB_NAME', 'recipes_db')
+DB_USER = os.getenv('DB_USER', 'postgres')
+DB_PASSWORD = os.getenv('DB_PASSWORD', '123Secret_a') # <-- УКАЖИТЕ ВАШ ПАРОЛЬ
 
-# === СЛОВАРЬ СИНОНИМОВ ===
-SYNONYMS = {
-    'картошка': 'картофель',
-    'помидор': 'томат',
-    'помидоры': 'томат',
-    'томаты': 'томат',
-    'куриное': 'курица',
-    'куриные': 'курица',
-    'яйцо': 'яйца',
-    'луковица': 'лук',
-}
+# Коэффициенты для формулы k*d + m*f
+K_COEF = 1.0
+M_COEF = -2.0  # Отрицательный, чтобы частые ингредиенты были "лучше"
 
-# === БАЗОВЫЕ ПРОДУКТЫ ===
-BASE_INGREDIENTS = {
-    'соль', 'вода', 'сахар', 'перец', 'масло', 
-    'масло растительное', 'масло сливочное', 
-    'специи', 'приправа', 'зелень', 'мука', 'сода', 'уксус'
-}
-
-def get_lemmas(text):
-    text = re.sub(r'\s+и\s+', ',', text)
-    words = [w.strip() for w in text.split(',') if w.strip()]
-    
-    all_lemmas = []
-    for word in words:
-        doc = Doc(word)
-        doc.segment(segmenter)
-        doc.tag_morph(morph_tagger)
+# ==========================================
+# 2. ПОИСК РЕЦЕПТОВ (С формулой k*d + m*f)
+# ==========================================
+def find_recipes_smart(user_input_text):
+    """Ищет рецепты, используя формулу k*d + m*f"""
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, dbname=DB_NAME
+        )
+        cursor = conn.cursor()
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;")
+        conn.commit()
         
-        for token in doc.tokens:
-            token.lemmatize(morph_vocab)
-            lemma = token.lemma if token.lemma else token.text.lower()
-            if lemma in SYNONYMS:
-                lemma = SYNONYMS[lemma]
-            all_lemmas.append(lemma)
-            
-    return list(set(all_lemmas))
-
-# ==========================================
-# 2. ПОИСК РЕЦЕПТОВ (Строгое совпадение)
-# ==========================================
-def find_recipes_smart(user_ingredients):
-    if not user_ingredients:
-        return []
+        clean_input = ''.join(c for c in user_input_text if c.isprintable())
         
-    conn = sqlite3.connect('recipes.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT r.id, r.title, r.url, i.lemma, i.name
+        query = r"""
+        WITH user_words AS (
+            -- 1. Разбиваем запрос пользователя на слова
+            SELECT DISTINCT lower(regexp_replace(word, '[^a-zа-яё]', '', 'g')) AS word
+            FROM regexp_split_to_table(%s::text, '\s+') AS word
+            WHERE length(regexp_replace(word, '[^a-zа-яё]', '', 'g')) >= 3
+        ),
+        db_words AS (
+            -- 2. Разбиваем названия ингредиентов в БД на слова
+            SELECT id, name, lower(regexp_replace(word, '[^a-zа-яё]', '', 'g')) AS db_word
+            FROM ingredients, regexp_split_to_table(name, '\s+') AS word
+            WHERE length(name) < 50
+        ),
+        -- 3. Считаем частоту каждого ингредиента в рецептах (freq)
+        ingredient_freq AS (
+            SELECT i.id, COALESCE(COUNT(ri.recipe_id), 0) as freq
+            FROM ingredients i
+            LEFT JOIN recipe_ingredients ri ON i.id = ri.ingredient_id
+            GROUP BY i.id
+        ),
+        -- 4. Находим минимальную и максимальную частоту
+        min_max_freq AS (
+            SELECT MIN(freq) as min_f, MAX(freq) as max_f FROM ingredient_freq
+        ),
+        -- 5. Нормализуем частоту (f): (freq - min) / (max - min)
+        normalized_freq AS (
+            SELECT 
+                f.id,
+                CASE 
+                    WHEN m.max_f = m.min_f THEN 0.0 
+                    ELSE (f.freq - m.min_f)::numeric / (m.max_f - m.min_f) 
+                END as f_val
+            FROM ingredient_freq f
+            CROSS JOIN min_max_freq m
+        ),
+        -- 6. Считаем расстояние Левенштейна (d) и итоговый скор
+        distances AS (
+            SELECT 
+                dw.id, 
+                dw.name, 
+                levenshtein(dw.db_word, uw.word) AS d_val,
+                nf.f_val
+            FROM db_words dw
+            JOIN user_words uw ON length(dw.db_word) >= 3
+            JOIN normalized_freq nf ON dw.id = nf.id
+            WHERE levenshtein(dw.db_word, uw.word) <= 3 -- Отсекаем совсем непохожие
+        ),
+        scored AS (
+            -- ВЫЧИСЛЯЕМ ФОРМУЛУ: (k * d) + (m * f)
+            SELECT 
+                id,
+                name,
+                MIN((%s * d_val) + (%s * f_val)) AS best_score
+            FROM distances
+            GROUP BY id, name
+        ),
+        -- 7. Берем топ-20 ингредиентов с наименьшим скором
+        best_matches AS (
+            SELECT id, name, best_score
+            FROM scored
+            ORDER BY best_score ASC
+            LIMIT 20
+        )
+        -- 8. Выводим рецепты, где встречаются эти ингредиенты
+        SELECT 
+            encode(textsend(r.title), 'base64') as title_b64, 
+            r.url, 
+            encode(textsend(string_agg(i.name, ', ')), 'base64') as matched_ings_b64
         FROM recipes r
         JOIN recipe_ingredients ri ON r.id = ri.recipe_id
         JOIN ingredients i ON ri.ingredient_id = i.id
-    ''')
-    rows = cursor.fetchall()
-    conn.close()
-    
-    recipes_dict = {}
-    for row in rows:
-        r_id, title, url, lemma, name = row
-        if r_id not in recipes_dict:
-            recipes_dict[r_id] = {
-                'title': title, 
-                'url': url, 
-                'ingredients': [], 
-                'display_ingredients': set() 
-            }
+        JOIN best_matches bm ON i.id = bm.id
+        GROUP BY r.id, r.title, r.url
+        ORDER BY COUNT(i.id) DESC
+        LIMIT 5;
+        """
         
-        # Очищаем лемму от лишних символов
-        search_term = lemma.lower().strip() if lemma else name.lower().strip()
+        # Передаем текст пользователя и коэффициенты K и M
+        cursor.execute(query, (clean_input, K_COEF, M_COEF))
+        raw_results = cursor.fetchall()
+        conn.close()
         
-        # Применяем синонимы
-        for syn, base in SYNONYMS.items():
-             if syn == search_term:
-                 search_term = base
-                 
-        recipes_dict[r_id]['ingredients'].append((search_term, name))
-        recipes_dict[r_id]['display_ingredients'].add(name)
-        
-    user_set = set(user_ingredients)
-    results = []
-    
-    for r_id, data in recipes_dict.items():
-        
-        can_cook = True
-        user_ingredients_matched = 0 # Счетчик совпадений с пользователем
-        
-        for ing_lemma, ing_name in data['ingredients']:
+        results = []
+        for row in raw_results:
+            title_b64, url, ings_b64 = row
+            try:
+                title = base64.b64decode(title_b64).decode('utf-8', errors='replace')
+                matched_ings = base64.b64decode(ings_b64).decode('utf-8', errors='replace')
+                results.append((title, url, matched_ings))
+            except Exception:
+                pass
             
-            # Ищем точное или частичное совпадение с продуктами пользователя
-            is_user_has = False
-            for u_ing in user_set:
-                # Если слово пользователя совпадает с леммой или входит в неё
-                if u_ing == ing_lemma or (len(u_ing) > 3 and u_ing in ing_lemma):
-                    is_user_has = True
-                    user_ingredients_matched += 1
-                    break
-                    
-            if is_user_has:
-                continue # Продукт есть у пользователя
-            
-            # Если нет у пользователя, проверяем БАЗОВЫЕ
-            is_base = False
-            for b_ing in BASE_INGREDIENTS:
-                if b_ing == ing_lemma or (len(b_ing) > 3 and b_ing in ing_lemma):
-                    is_base = True
-                    break
-                    
-            if is_base:
-                continue # Это базовый продукт, прощаем
-                
-            # Если продукта нет ни у пользователя, ни в базе — отмена
-            can_cook = False
-            break
-            
-        # ГЛАВНОЕ ИСПРАВЛЕНИЕ: 
-        # Рецепт подходит, только если он готовится ИЗ ЧЕГО-ТО пользователя.
-        # Если совпадений 0 (например, только соль и вода), рецепт не выводим.
-        if can_cook and user_ingredients_matched > 0:
-            results.append({
-                'title': data['title'],
-                'url': data['url'],
-                'all_ingredients': list(data['display_ingredients'])
-            })
-            
-    results.sort(key=lambda x: len(x['all_ingredients']))
-    return results
+        return results
+    except Exception as e:
+        print(f"\n--- ОШИБКА ---\n{e}\n-------------")
+        return []
 
 # ==========================================
-# 3. КОНСОЛЬНЫЙ ИНТЕРФЕЙС
+# 3. ИНТЕРФЕЙС
 # ==========================================
 def main():
     print("\n" + "="*50)
-    print(" 🍳 ПОВАРЁНОК-БОТ: ЧТО ПРИГОТОВИТЬ?")
+    print(" 🍳 БОТ (Формула k*d + m*f)")
     print("="*50)
     
     while True:
@@ -152,27 +143,21 @@ def main():
         if user_input.lower() in ['выход', 'exit', 'quit']: break
         if not user_input: continue
             
-        user_lemmas = get_lemmas(user_input)
-        print(f"🔍 Ищем рецепты из: {', '.join(user_lemmas)}...")
+        print(f"🔍 Ищем лучшие совпадения для: '{user_input}'...")
         
-        try:
-            results = find_recipes_smart(user_lemmas)
-        except sqlite3.OperationalError as e:
-            print(f"Ошибка БД: {e}")
-            break
+        results = find_recipes_smart(user_input)
         
         if not results:
-            print("😔 Ничего не нашлось. В базе нет рецептов строго из этих продуктов.\n")
+            print("😔 Ничего не нашлось.\n")
             continue
             
-        print(f"\n✅ Найдено подходящих рецептов: {len(results)}\n")
+        print(f"\n✅ Найдено рецептов: {len(results)}\n")
         
-        # Показываем топ-5, чтобы не засорять консоль
-        for i, r in enumerate(results[:5]):
-            print(f"{i+1}. {r['title']}")
-            print(f"   Ссылка: {r['url']}")
-            ings_str = ", ".join(sorted(r['all_ingredients']))
-            print(f"   Ингредиенты: {ings_str}")
+        for i, r in enumerate(results):
+            title, url, matched_ings = r
+            print(f"{i+1}. {title}")
+            print(f"   Ингредиенты: {matched_ings}")
+            print(f"   {url}")
             print("-" * 50)
             
         print("\n")
